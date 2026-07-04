@@ -6,6 +6,13 @@ an allow-listed set of users to a local `claude` (Claude Code CLI) session,
 and posts the reply back as a threaded Slack message. Each Slack thread maps
 to its own resumable Claude Code session.
 
+You can also ask, in plain language, to switch a thread to a different past
+session - by session ID, project name, or description (e.g. "switch to the
+session where we discussed the crypto-agent rate limiter"). Claude searches
+its own local session transcripts under `~/.claude/projects` to find a match
+and the bot switches that thread onto it; a follow-up message in the same
+thread will then resume with that session's history.
+
 ## Security note
 
 By default this runs Claude Code with `--permission-mode bypassPermissions`,
@@ -60,5 +67,11 @@ systemd unit) for a persistent background process.
 
 - Thread <-> Claude session mapping is in-memory only: restarting the process
   starts a fresh Claude session the next time a given thread gets a message.
+  This mapping also tracks which directory each thread's session runs from,
+  since resuming a session requires running from the same directory it
+  originally started in - this matters once a thread has switched onto a
+  session from a different project.
 - `CLAUDE_ADD_DIRS` (default `~/proj`) grants Claude Code file/tool access to
   everything under that path, so it can act on projects beyond this repo.
+  `~/.claude/projects` (where session transcripts live) is always granted
+  too, so Claude can search past sessions when asked to switch.

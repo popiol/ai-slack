@@ -6,10 +6,43 @@ import json
 import logging
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import Config
 
 logger = logging.getLogger(__name__)
+
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+
+RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reply": {"type": "string"},
+        "action": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "enum": ["none", "switch_session"]},
+                "params": {"type": "object"},
+            },
+            "required": ["type", "params"],
+        },
+    },
+    "required": ["reply", "action"],
+}
+
+SYSTEM_PROMPT_ADDENDUM = (
+    "Local Claude Code session transcripts live under "
+    "~/.claude/projects/<encoded-project-path>/<session-id>.jsonl (one file per "
+    "past session), each line a JSON event; the 'cwd' field on user/assistant "
+    "events records the project directory that session ran in. If the user's "
+    "message asks you to switch, resume, or continue a different past session "
+    "(by id, project, or description), explore that directory (ls/grep/cat) to "
+    "find the matching session file, then set action.type='switch_session' with "
+    "action.params={\"session_id\": <id>, \"cwd\": <that session's cwd>}. "
+    "Otherwise set action.type='none' with params={}. Always fill 'reply' with "
+    "a user-facing message - either your normal answer, or (when switching) a "
+    "short confirmation of what you switched to and why."
+)
 
 
 class ClaudeRunError(Exception):
@@ -17,18 +50,30 @@ class ClaudeRunError(Exception):
 
 
 @dataclass
+class ClaudeAction:
+    type: str
+    params: dict
+
+
+@dataclass
 class ClaudeResult:
-    text: str
+    reply: str
     session_id: str
     is_error: bool
+    action: ClaudeAction
 
 
-def run_claude(config: Config, prompt: str, session_id: str | None) -> ClaudeResult:
+def run_claude(
+    config: Config, prompt: str, session_id: str | None, cwd: Path
+) -> ClaudeResult:
     """Invoke `claude -p` once, optionally resuming an existing session.
 
     Blocking call - the caller is expected to run this off the Slack event loop
     thread (e.g. via a background thread or executor).
     """
+    if not cwd.is_dir():
+        raise ClaudeRunError(f"cwd {cwd} does not exist or is not a directory")
+
     args = [
         config.claude_bin,
         "-p",
@@ -36,8 +81,12 @@ def run_claude(config: Config, prompt: str, session_id: str | None) -> ClaudeRes
         "json",
         "--permission-mode",
         config.claude_permission_mode,
+        "--json-schema",
+        json.dumps(RESPONSE_SCHEMA),
+        "--append-system-prompt",
+        SYSTEM_PROMPT_ADDENDUM,
     ]
-    for add_dir in config.claude_add_dirs:
+    for add_dir in [*config.claude_add_dirs, str(CLAUDE_PROJECTS_DIR)]:
         args += ["--add-dir", add_dir]
     if session_id:
         args += ["--resume", session_id]
@@ -48,9 +97,10 @@ def run_claude(config: Config, prompt: str, session_id: str | None) -> ClaudeRes
     try:
         completed = subprocess.run(
             args,
-            cwd=config.claude_working_dir,
+            cwd=cwd,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=config.claude_timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
@@ -67,13 +117,20 @@ def run_claude(config: Config, prompt: str, session_id: str | None) -> ClaudeRes
 
     try:
         payload = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+        structured = payload["structured_output"]
+    except (json.JSONDecodeError, KeyError) as exc:
         raise ClaudeRunError(
-            f"Could not parse claude output as JSON: {completed.stdout[:500]!r}"
+            f"Could not parse claude structured output: {completed.stdout[:500]!r}"
         ) from exc
 
+    action_payload = structured.get("action") or {"type": "none", "params": {}}
+
     return ClaudeResult(
-        text=payload.get("result", ""),
+        reply=structured.get("reply", ""),
         session_id=payload["session_id"],
         is_error=bool(payload.get("is_error", False)),
+        action=ClaudeAction(
+            type=action_payload.get("type", "none"),
+            params=action_payload.get("params") or {},
+        ),
     )

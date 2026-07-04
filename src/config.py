@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _require(name: str) -> str:
@@ -39,6 +39,7 @@ class Config:
     claude_add_dirs: list[str]
     claude_permission_mode: str
     claude_timeout_seconds: int
+    log_level: str
 
 
 def load_config() -> Config:
@@ -50,11 +51,11 @@ def load_config() -> Config:
         )
 
     working_dir = Path(
-        os.environ.get("CLAUDE_WORKING_DIR", str(REPO_ROOT))
+        os.environ.get("CLAUDE_WORKING_DIR") or str(REPO_ROOT)
     ).expanduser().resolve()
 
     add_dirs = _split_csv(
-        os.environ.get("CLAUDE_ADD_DIRS", str(Path.home() / "proj"))
+        os.environ.get("CLAUDE_ADD_DIRS") or str(Path.home() / "proj")
     )
 
     return Config(
@@ -62,13 +63,13 @@ def load_config() -> Config:
         slack_app_token=_require("SLACK_APP_TOKEN"),
         slack_channel_id=_require("SLACK_CHANNEL_ID"),
         allowed_user_ids=set(allowed_users),
-        claude_bin=os.environ.get("CLAUDE_BIN", "claude"),
+        claude_bin=os.environ.get("CLAUDE_BIN") or "claude",
         claude_working_dir=working_dir,
         claude_add_dirs=add_dirs,
-        claude_permission_mode=os.environ.get(
-            "CLAUDE_PERMISSION_MODE", "bypassPermissions"
-        ),
+        claude_permission_mode=os.environ.get("CLAUDE_PERMISSION_MODE")
+        or "bypassPermissions",
         claude_timeout_seconds=int(
-            os.environ.get("CLAUDE_TIMEOUT_SECONDS", "1800")
+            os.environ.get("CLAUDE_TIMEOUT_SECONDS") or "1800"
         ),
+        log_level=(os.environ.get("LOG_LEVEL") or "INFO").upper(),
     )
