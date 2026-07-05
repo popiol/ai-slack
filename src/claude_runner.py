@@ -31,6 +31,14 @@ RESPONSE_SCHEMA = {
 }
 
 SYSTEM_PROMPT_ADDENDUM = (
+    "You are being driven through Slack, not an interactive terminal. The user "
+    "can ONLY see the text you put in the 'reply' field of your structured "
+    "response - they cannot see any tool calls, command output, file contents, "
+    "diffs, or anything else you produce while working. Never refer to "
+    "something as 'shown above', 'listed above', or similar, since nothing is "
+    "shown to the user except 'reply' itself - always inline the actual, "
+    "complete content (file contents, command output, lists, etc.) directly "
+    "in 'reply'.\n\n"
     "Local Claude Code session transcripts live under "
     "~/.claude/projects/<encoded-project-path>/<session-id>.jsonl (one file per "
     "past session), each line a JSON event; the 'cwd' field on user/assistant "
@@ -38,15 +46,44 @@ SYSTEM_PROMPT_ADDENDUM = (
     "message asks you to switch, resume, or continue a different past session "
     "(by id, project, or description), explore that directory (ls/grep/cat) to "
     "find the matching session file, then set action.type='switch_session' with "
-    "action.params={\"session_id\": <id>, \"cwd\": <that session's cwd>}. "
+    "action.params={\"session_id\": <id>, \"cwd\": <that session's recorded "
+    "cwd, exactly as found in the transcript>}. "
     "Otherwise set action.type='none' with params={}. Always fill 'reply' with "
-    "a user-facing message - either your normal answer, or (when switching) a "
-    "short confirmation of what you switched to and why."
+    "a complete, self-contained user-facing message - either your normal "
+    "answer, or (when switching) a short confirmation of what you switched to "
+    "and why."
 )
 
 
 class ClaudeRunError(Exception):
     pass
+
+
+def find_session_cwd(session_id: str) -> Path | None:
+    """Look up a session's actual recorded cwd directly from its transcript
+    file, rather than trusting a model-regenerated copy of the path. The
+    model can retype a path incorrectly (e.g. swapping '-' for '_') even
+    when it read the correct value - reading the transcript ourselves is
+    exact, since it's just a string copy in code, not a regeneration."""
+    matches = list(CLAUDE_PROJECTS_DIR.glob(f"*/{session_id}.jsonl"))
+    if not matches:
+        return None
+    try:
+        with matches[0].open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = event.get("cwd")
+                if cwd:
+                    return Path(cwd)
+    except OSError:
+        return None
+    return None
 
 
 @dataclass
@@ -109,19 +146,34 @@ def run_claude(
         ) from exc
 
     if completed.returncode != 0:
-        logger.error("claude exited %s: %s", completed.returncode, completed.stderr)
+        logger.error(
+            "claude exited %s: stderr=%r stdout=%r",
+            completed.returncode, completed.stderr, completed.stdout,
+        )
+        detail = completed.stderr.strip() or completed.stdout.strip() or "(no output)"
         raise ClaudeRunError(
-            f"claude exited with status {completed.returncode}: "
-            f"{completed.stderr.strip() or '(no stderr)'}"
+            f"claude exited with status {completed.returncode}: {detail}"
         )
 
     try:
         payload = json.loads(completed.stdout)
-        structured = payload["structured_output"]
-    except (json.JSONDecodeError, KeyError) as exc:
+    except json.JSONDecodeError as exc:
         raise ClaudeRunError(
-            f"Could not parse claude structured output: {completed.stdout[:500]!r}"
+            f"Could not parse claude output as JSON: {completed.stdout[:500]!r}"
         ) from exc
+
+    # `structured_output` can be absent even on a successful run - notably when
+    # resuming a session that predates --json-schema being passed, claude may
+    # just answer in plain `result` text and skip the schema entirely. Degrade
+    # to a plain reply with no action rather than failing the whole run.
+    structured = payload.get("structured_output")
+    if structured is None:
+        logger.warning(
+            "claude returned no structured_output (session=%s); falling back to "
+            "plain result text",
+            payload.get("session_id"),
+        )
+        structured = {"reply": payload.get("result", ""), "action": None}
 
     action_payload = structured.get("action") or {"type": "none", "params": {}}
 

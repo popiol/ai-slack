@@ -14,7 +14,7 @@ from pathlib import Path
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from .claude_runner import ClaudeRunError, run_claude
+from .claude_runner import ClaudeRunError, find_session_cwd, run_claude
 from .config import Config, load_config
 from .slack_format import chunk_text, to_slack_mrkdwn
 
@@ -89,7 +89,19 @@ def _apply_action(thread_ts: str, result, cwd: Path) -> str | None:
         return None
 
     new_session_id = result.action.params["session_id"]
-    new_cwd = Path(result.action.params.get("cwd") or cwd)
+    # Look the cwd up directly from the target session's own transcript file
+    # rather than trusting Claude's regenerated copy of the path in
+    # action.params - the model can subtly mistype it (e.g. '-' vs '_') even
+    # when it read the correct value. Fall back to Claude's reported value
+    # only if the transcript can't be found.
+    actual_cwd = find_session_cwd(new_session_id)
+    if actual_cwd is None:
+        logger.warning(
+            "Could not find transcript for session %s to verify cwd; falling "
+            "back to claude-reported value",
+            new_session_id,
+        )
+    new_cwd = actual_cwd or Path(result.action.params.get("cwd") or cwd)
     if not new_cwd.is_dir():
         logger.warning(
             "Switch target for thread %s has stale cwd %s; keeping current session %s",
@@ -148,13 +160,16 @@ def _process(event: dict, client, config: Config) -> None:
 
     switch_failure = _apply_action(thread_ts, result, cwd)
     if switch_failure:
+        # Claude's own `reply` assumed the switch succeeded (it has no idea we
+        # rejected it for a stale cwd), so posting it alongside this warning
+        # would contradict it. The warning alone fully explains what happened.
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=switch_failure)
-
-    reply = to_slack_mrkdwn(result.reply) or "(no output)"
-    chunks = chunk_text(reply)
-    for i, chunk in enumerate(chunks, start=1):
-        client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
-        logger.debug("Posted reply chunk %d/%d to thread %s", i, len(chunks), thread_ts)
+    else:
+        reply = to_slack_mrkdwn(result.reply) or "(no output)"
+        chunks = chunk_text(reply)
+        for i, chunk in enumerate(chunks, start=1):
+            client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=chunk)
+            logger.debug("Posted reply chunk %d/%d to thread %s", i, len(chunks), thread_ts)
 
     _swap_reaction(
         client, channel, ts, "eyes", "x" if result.is_error else "white_check_mark"
