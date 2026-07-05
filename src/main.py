@@ -61,6 +61,14 @@ def _should_handle(event: dict, config: Config) -> bool:
     return True
 
 
+def _add_reaction_safe(client, channel: str, ts: str, name: str) -> None:
+    try:
+        client.reactions_add(channel=channel, timestamp=ts, name=name)
+        logger.debug("Added :%s: reaction to %s", name, ts)
+    except Exception:
+        logger.exception("Failed to add :%s: reaction to %s", name, ts)
+
+
 def _run_claude_safe(config: Config, text: str, session_id, cwd, client, channel, thread_ts, ts):
     """Run claude and report any failure to Slack. Returns None on failure."""
     try:
@@ -135,11 +143,12 @@ def _process(event: dict, client, config: Config) -> None:
         ts, thread_ts, user, text,
     )
 
-    try:
-        client.reactions_add(channel=channel, timestamp=ts, name="eyes")
-        logger.debug("Added :eyes: reaction to %s", ts)
-    except Exception:
-        logger.exception("Failed to add :eyes: reaction to %s", ts)
+    # Fire-and-forget: the reaction is purely cosmetic feedback, so don't make
+    # the claude subprocess (the actually slow part) wait on this network
+    # round-trip before it even starts.
+    threading.Thread(
+        target=_add_reaction_safe, args=(client, channel, ts, "eyes"), daemon=True
+    ).start()
 
     with _sessions_lock:
         existing = _sessions.get(thread_ts)
